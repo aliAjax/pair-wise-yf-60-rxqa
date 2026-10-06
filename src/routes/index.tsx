@@ -5,35 +5,17 @@ import { createForm, zodForm } from '@modular-forms/solid';
 import { Tabs } from '@ark-ui/solid';
 import { flatten, resolveTemplate, translator } from '@solid-primitives/i18n';
 import { z } from 'zod';
-
-type IssueStatus = 'open' | 'triaged' | 'fixing' | 'verifying' | 'closed' | 'reopened';
-type Severity = 'critical' | 'serious' | 'moderate' | 'minor';
-interface AuditIssue {
-  id: string;
-  title: string;
-  flow: string;
-  steps: string;
-  impactGroup: string;
-  severity: Severity;
-  status: IssueStatus;
-  canonicalId?: string;
-  fixNote: string;
-  retestNote: string;
-  updatedAt: string;
-}
-interface AuditEvent { id: string; at: string; issueId: string; message: string }
-interface WorkbenchState { issues: AuditIssue[]; events: AuditEvent[] }
-
-const seed: WorkbenchState = {
-  issues: [
-    { id: 'issue-1', title: '结算弹窗关闭后焦点丢失', flow: '订单结算', steps: '1. 打开结算弹窗\n2. 按 Esc 关闭\n3. 按 Tab 检查焦点', impactGroup: '键盘与读屏用户', severity: 'serious', status: 'triaged', fixNote: '', retestNote: '', updatedAt: new Date(Date.now() - 3600_000).toISOString() },
-    { id: 'issue-2', title: '错误提示未与输入框关联', flow: '账户设置', steps: '输入无效手机号后使用读屏读取输入框', impactGroup: '读屏用户', severity: 'moderate', status: 'fixing', fixNote: '已增加 aria-describedby，等待构建', retestNote: '', updatedAt: new Date(Date.now() - 7200_000).toISOString() }
-  ],
-  events: [
-    { id: 'e-1', at: new Date(Date.now() - 3600_000).toISOString(), issueId: 'issue-1', message: '审核员确认问题有效并进入修复中' },
-    { id: 'e-2', at: new Date(Date.now() - 7000_000).toISOString(), issueId: 'issue-2', message: '开发人员提交焦点管理修复' }
-  ]
-};
+import {
+  STORAGE_KEY,
+  collectReopenedDuplicates,
+  findDependencyCycle,
+  loadState,
+  mergeStates,
+  parseWorkbench,
+  persistState,
+  sameContent
+} from '../lib/audit-store';
+import type { AuditIssue, Severity, WorkbenchState } from '../lib/audit-store';
 
 const issueSchema = z.object({
   title: z.string().min(4, '标题至少4个字'),
@@ -49,11 +31,6 @@ const dictionaries = {
   en: flatten({ title: 'Accessibility Audit Workbench', subtitle: 'Issues, fixes and retesting', issues: 'Audit issues', merge: 'Duplicate merge', events: 'Activity timeline' })
 };
 
-function loadState(): WorkbenchState {
-  if (typeof localStorage === 'undefined') return seed;
-  try { return JSON.parse(localStorage.getItem('a11y-audit-v1') ?? 'null') as WorkbenchState ?? seed; } catch { return seed; }
-}
-
 export default function AuditWorkbench() {
   const queryClient = useQueryClient();
   const [language, setLanguage] = createSignal<'zh' | 'en'>('zh');
@@ -61,6 +38,10 @@ export default function AuditWorkbench() {
   const [state, setState] = createStore<WorkbenchState>(loadState());
   const [selectedId, setSelectedId] = createSignal(state.issues[0]?.id ?? '');
   const [mergeInto, setMergeInto] = createSignal('');
+  const [depTarget, setDepTarget] = createSignal('');
+  const [depError, setDepError] = createSignal('');
+  const [saveError, setSaveError] = createSignal('');
+  const [lastSavedAt, setLastSavedAt] = createSignal('');
   const [focusedIssueId, setFocusedIssueId] = createSignal('');
   const issueQuery = createQuery(() => ({
     queryKey: ['audit-issues', state.issues.length],
@@ -73,20 +54,51 @@ export default function AuditWorkbench() {
   });
 
   const selected = createMemo(() => state.issues.find((issue) => issue.id === selectedId()) ?? state.issues[0]);
+  const issueById = (id: string) => state.issues.find((issue) => issue.id === id);
+  const openBlockers = (issue: AuditIssue) =>
+    issue.blockedBy.map((id) => issueById(id)).filter((blocker): blocker is AuditIssue => Boolean(blocker) && blocker!.status !== 'closed');
+  const dependentsOf = (id: string) => state.issues.filter((issue) => issue.blockedBy.includes(id));
+  const duplicatesOf = (id: string) => state.issues.filter((issue) => issue.canonicalId === id);
 
-  createEffect(() => {
-    if (typeof localStorage !== 'undefined') localStorage.setItem('a11y-audit-v1', JSON.stringify(state));
-  });
+  const adoptState = (next: WorkbenchState) => {
+    setState('issues', next.issues);
+    setState('events', next.events);
+  };
+
+  // 合并已存记录后落盘，避免另一个标签页先到的改动被盖掉；失败时保留错误供重试。
+  const persistNow = () => {
+    const snapshot = JSON.parse(JSON.stringify(state)) as WorkbenchState;
+    const result = persistState(snapshot);
+    if (result.ok) {
+      setSaveError('');
+      setLastSavedAt(new Date().toLocaleTimeString());
+      if (!sameContent(result.state, snapshot)) adoptState(result.state);
+    } else {
+      setSaveError(result.error);
+    }
+  };
+
+  createEffect(() => persistNow());
 
   const addEvent = (issueId: string, message: string) => setState('events', (events) => [{ id: crypto.randomUUID(), at: new Date().toISOString(), issueId, message }, ...events]);
   const updateIssue = (id: string, patch: Partial<AuditIssue>, message: string) => {
     setState('issues', (issue) => issue.id === id, produce((issue) => Object.assign(issue, patch, { updatedAt: new Date().toISOString() })));
     addEvent(id, message);
+    if (patch.status === 'reopened') {
+      const reopened = issueById(id);
+      for (const duplicate of collectReopenedDuplicates(state.issues, id)) {
+        setState('issues', (issue) => issue.id === duplicate.id, produce((issue) => {
+          issue.status = 'verifying';
+          issue.updatedAt = new Date().toISOString();
+        }));
+        addEvent(duplicate.id, `主问题「${reopened?.title ?? id}」重新打开，重复项回到待复测`);
+      }
+    }
     void queryClient.invalidateQueries({ queryKey: ['audit-issues'] });
   };
 
   const createIssue = (values: IssueForm) => {
-    const issue: AuditIssue = { id: crypto.randomUUID(), ...values, status: 'open', fixNote: '', retestNote: '', updatedAt: new Date().toISOString() };
+    const issue: AuditIssue = { id: crypto.randomUUID(), ...values, status: 'open', blockedBy: [], fixNote: '', retestNote: '', updatedAt: new Date().toISOString() };
     setState('issues', (issues) => [issue, ...issues]);
     setSelectedId(issue.id);
     addEvent(issue.id, '审计员创建问题并保存证据');
@@ -101,6 +113,35 @@ export default function AuditWorkbench() {
     setSelectedId(canonical.id);
   };
 
+  const registerDependency = () => {
+    const issue = selected();
+    const blocker = issueById(depTarget());
+    if (!issue || !blocker) return;
+    const cycle = findDependencyCycle(state.issues, issue.id, blocker.id);
+    if (cycle) {
+      const names = cycle.map((id) => issueById(id)?.title ?? id);
+      setDepError(`检测到循环依赖，已拦截：${names.join(' → ')}`);
+      return;
+    }
+    setDepError('');
+    updateIssue(issue.id, { blockedBy: [...issue.blockedBy, blocker.id] }, `登记依赖：「${issue.title}」被「${blocker.title}」阻塞，待其关闭后再复测`);
+    setDepTarget('');
+  };
+
+  const removeDependency = (blockerId: string) => {
+    const issue = selected();
+    if (!issue) return;
+    const blocker = issueById(blockerId);
+    updateIssue(issue.id, { blockedBy: issue.blockedBy.filter((id) => id !== blockerId) }, `解除「${issue.title}」对「${blocker?.title ?? blockerId}」的依赖`);
+  };
+
+  // 切换选中问题时，清掉上一个问题残留的依赖登记选择
+  createEffect(() => {
+    selectedId();
+    setDepTarget('');
+    setDepError('');
+  });
+
   onMount(() => {
     const shortcut = (event: KeyboardEvent) => {
       if (event.key.toLowerCase() === 'n' && document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'TEXTAREA') {
@@ -108,8 +149,21 @@ export default function AuditWorkbench() {
         document.querySelector<HTMLInputElement>('#issue-title')?.focus();
       }
     };
+    // 另一个标签页写入后，把对方改动合并进当前记录
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== STORAGE_KEY || !event.newValue) return;
+      const remote = parseWorkbench(event.newValue);
+      if (!remote) return;
+      const snapshot = JSON.parse(JSON.stringify(state)) as WorkbenchState;
+      const merged = mergeStates(remote, snapshot);
+      if (!sameContent(merged, snapshot)) adoptState(merged);
+    };
     window.addEventListener('keydown', shortcut);
-    onCleanup(() => window.removeEventListener('keydown', shortcut));
+    window.addEventListener('storage', onStorage);
+    onCleanup(() => {
+      window.removeEventListener('keydown', shortcut);
+      window.removeEventListener('storage', onStorage);
+    });
   });
 
   return (
@@ -118,13 +172,22 @@ export default function AuditWorkbench() {
       <main class="shell" id="main-content">
         <header class="hero">
           <div><span class="badge">WCAG 人工审计协作</span><h1>{t()('title')}</h1><p>{t()('subtitle')} · 快捷键 N 聚焦新建问题，Ctrl+Enter 提交</p></div>
-          <button class="secondary" onClick={() => setLanguage(language() === 'zh' ? 'en' : 'zh')}>{language() === 'zh' ? 'English' : '中文'}</button>
+          <div class="save-area">
+            <button class="secondary" onClick={() => setLanguage(language() === 'zh' ? 'en' : 'zh')}>{language() === 'zh' ? 'English' : '中文'}</button>
+            <p role="status" class="save-status">
+              {saveError() ? `保存失败：${saveError()}` : `记录已自动保存${lastSavedAt() ? ` · 上次 ${lastSavedAt()}` : ''}`}
+            </p>
+            <Show when={saveError()}>
+              <button class="danger" onClick={persistNow}>重试保存</button>
+            </Show>
+          </div>
         </header>
 
         <section class="stats" aria-label="审计概览">
           <div class="card"><span>全部问题</span><strong>{state.issues.length}</strong></div>
           <div class="card"><span>待修复</span><strong>{state.issues.filter((issue) => ['open', 'triaged', 'fixing', 'reopened'].includes(issue.status)).length}</strong></div>
           <div class="card"><span>待复测</span><strong>{state.issues.filter((issue) => issue.status === 'verifying').length}</strong></div>
+          <div class="card"><span>被阻塞</span><strong>{state.issues.filter((issue) => openBlockers(issue).length > 0).length}</strong></div>
           <div class="card"><span>已关闭</span><strong>{state.issues.filter((issue) => issue.status === 'closed').length}</strong></div>
         </section>
 
@@ -134,7 +197,7 @@ export default function AuditWorkbench() {
             <For each={state.issues}>{(issue) => (
               <article class="issue" style={focusedIssueId() === issue.id ? 'background:#eefaf8;border-radius:10px;padding-left:12px' : ''}>
                 <h3><button class="secondary" onClick={() => setSelectedId(issue.id)} aria-current={selectedId() === issue.id ? 'true' : undefined}>{issue.title}</button></h3>
-                <div class="meta"><span class="badge">{issue.status}</span><span class="badge">{issue.severity}</span><span>{issue.flow}</span><span>{issue.impactGroup}</span><Show when={issue.canonicalId}><span class="badge">重复项</span></Show></div>
+                <div class="meta"><span class="badge">{issue.status}</span><span class="badge">{issue.severity}</span><span>{issue.flow}</span><span>{issue.impactGroup}</span><Show when={issue.canonicalId}><span class="badge">重复项</span></Show><Show when={openBlockers(issue).length > 0}><span class="badge blocked">被阻塞</span></Show></div>
               </article>
             )}</For>
           </section>
@@ -148,6 +211,20 @@ export default function AuditWorkbench() {
                 <p><strong>复现步骤：</strong>{issue.steps}</p>
                 <p><strong>修复记录：</strong>{issue.fixNote || '尚未填写'}</p>
                 <p><strong>复测记录：</strong>{issue.retestNote || '尚未填写'}</p>
+                <Show when={issue.canonicalId}>
+                  <p>本问题是重复项，主问题：<button class="secondary" onClick={() => setSelectedId(issue.canonicalId!)}>{issueById(issue.canonicalId!)?.title ?? issue.canonicalId}</button></p>
+                </Show>
+                <Show when={duplicatesOf(issue.id).length > 0}>
+                  <p><strong>重复项（{duplicatesOf(issue.id).length}）：</strong></p>
+                  <ul>
+                    <For each={duplicatesOf(issue.id)}>{(duplicate) => (
+                      <li><button class="secondary" onClick={() => setSelectedId(duplicate.id)}>{duplicate.title}</button> <span class="badge">{duplicate.status}</span></li>
+                    )}</For>
+                  </ul>
+                </Show>
+                <Show when={openBlockers(issue).length > 0}>
+                  <p class="error" role="alert">该问题仍被 {openBlockers(issue).length} 个问题阻塞（{openBlockers(issue).map((blocker) => blocker.title).join('、')}），建议阻塞问题关闭后再提交复测。</p>
+                </Show>
                 <div role="group" aria-label="问题状态操作">
                   <button onClick={() => updateIssue(issue.id, { status: 'triaged' }, '审核员完成分诊')}>确认问题</button>{' '}
                   <button onClick={() => updateIssue(issue.id, { status: 'fixing', fixNote: '修复进行中，等待提交复测版本' }, '开发人员开始修复')}>开始修复</button>{' '}
@@ -155,6 +232,30 @@ export default function AuditWorkbench() {
                   <button onClick={() => updateIssue(issue.id, { status: 'closed', retestNote: '键盘、读屏和错误提示均已通过' }, '复测通过并关闭问题')}>复测通过</button>{' '}
                   <button class="danger" onClick={() => updateIssue(issue.id, { status: 'reopened', retestNote: '焦点顺序仍不正确' }, '复测失败并重新打开')}>复测失败</button>
                 </div>
+                <hr />
+                <h4>依赖关系</h4>
+                <Show when={issue.blockedBy.length > 0} fallback={<p>暂无依赖。若本问题被其他问题卡住，可在下方登记。</p>}>
+                  <ul>
+                    <For each={issue.blockedBy}>{(blockerId) => (
+                      <li style="margin-bottom:8px">
+                        <button class="secondary" onClick={() => setSelectedId(blockerId)}>{issueById(blockerId)?.title ?? '未知问题'}</button>{' '}
+                        <span class="badge">{issueById(blockerId)?.status ?? '已删除'}</span>{' '}
+                        <button class="secondary" onClick={() => removeDependency(blockerId)}>解除依赖</button>
+                      </li>
+                    )}</For>
+                  </ul>
+                </Show>
+                <Show when={dependentsOf(issue.id).length > 0}>
+                  <p>以下问题被本问题阻塞：{dependentsOf(issue.id).map((dependent) => dependent.title).join('、')}</p>
+                </Show>
+                <label>登记依赖
+                  <select value={depTarget()} onChange={(event) => setDepTarget(event.currentTarget.value)}>
+                    <option value="">选择阻塞本问题的问题</option>
+                    <For each={state.issues.filter((item) => item.id !== issue.id && !issue.blockedBy.includes(item.id))}>{(item) => <option value={item.id}>{item.title}</option>}</For>
+                  </select>
+                </label>
+                <div><button disabled={!depTarget()} onClick={registerDependency}>登记依赖</button></div>
+                <Show when={depError()}><p class="error" role="alert">{depError()}</p></Show>
                 <hr />
                 <label>合并到主问题<select value={mergeInto()} onChange={(event) => setMergeInto(event.currentTarget.value)}><option value="">选择问题</option><For each={state.issues.filter((item) => item.id !== issue.id && !item.canonicalId)}>{(item) => <option value={item.id}>{item.title}</option>}</For></select></label>
                 <button disabled={!mergeInto()} onClick={mergeDuplicate}>确认重复合并</button>
