@@ -1,39 +1,21 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from 'solid-js';
-import { createStore, produce } from 'solid-js/store';
+import { For, Show, createMemo, createSignal, onCleanup, onMount } from 'solid-js';
 import { createQuery, useQueryClient } from '@tanstack/solid-query';
-import { createForm, zodForm } from '@modular-forms/solid';
+import { createForm, setValue, zodForm } from '@modular-forms/solid';
 import { Tabs } from '@ark-ui/solid';
 import { flatten, resolveTemplate, translator } from '@solid-primitives/i18n';
 import { z } from 'zod';
-
-type IssueStatus = 'open' | 'triaged' | 'fixing' | 'verifying' | 'closed' | 'reopened';
-type Severity = 'critical' | 'serious' | 'moderate' | 'minor';
-interface AuditIssue {
-  id: string;
-  title: string;
-  flow: string;
-  steps: string;
-  impactGroup: string;
-  severity: Severity;
-  status: IssueStatus;
-  canonicalId?: string;
-  fixNote: string;
-  retestNote: string;
-  updatedAt: string;
-}
-interface AuditEvent { id: string; at: string; issueId: string; message: string }
-interface WorkbenchState { issues: AuditIssue[]; events: AuditEvent[] }
-
-const seed: WorkbenchState = {
-  issues: [
-    { id: 'issue-1', title: '结算弹窗关闭后焦点丢失', flow: '订单结算', steps: '1. 打开结算弹窗\n2. 按 Esc 关闭\n3. 按 Tab 检查焦点', impactGroup: '键盘与读屏用户', severity: 'serious', status: 'triaged', fixNote: '', retestNote: '', updatedAt: new Date(Date.now() - 3600_000).toISOString() },
-    { id: 'issue-2', title: '错误提示未与输入框关联', flow: '账户设置', steps: '输入无效手机号后使用读屏读取输入框', impactGroup: '读屏用户', severity: 'moderate', status: 'fixing', fixNote: '已增加 aria-describedby，等待构建', retestNote: '', updatedAt: new Date(Date.now() - 7200_000).toISOString() }
-  ],
-  events: [
-    { id: 'e-1', at: new Date(Date.now() - 3600_000).toISOString(), issueId: 'issue-1', message: '审核员确认问题有效并进入修复中' },
-    { id: 'e-2', at: new Date(Date.now() - 7000_000).toISOString(), issueId: 'issue-2', message: '开发人员提交焦点管理修复' }
-  ]
-};
+import {
+  STORE_KEY,
+  seedState,
+  createPersistentStore,
+  activeBlockersOf,
+  dependenciesOf,
+  findCycle,
+  type AuditIssue,
+  type Dependency,
+  type IssueStatus,
+  type Severity
+} from '~/lib/audit';
 
 const issueSchema = z.object({
   title: z.string().min(4, '标题至少4个字'),
@@ -49,21 +31,27 @@ const dictionaries = {
   en: flatten({ title: 'Accessibility Audit Workbench', subtitle: 'Issues, fixes and retesting', issues: 'Audit issues', merge: 'Duplicate merge', events: 'Activity timeline' })
 };
 
-function loadState(): WorkbenchState {
-  if (typeof localStorage === 'undefined') return seed;
-  try { return JSON.parse(localStorage.getItem('a11y-audit-v1') ?? 'null') as WorkbenchState ?? seed; } catch { return seed; }
-}
+const statusLabel: Record<IssueStatus, string> = {
+  open: '待分诊',
+  triaged: '已分诊',
+  fixing: '修复中',
+  verifying: '待复测',
+  closed: '已关闭',
+  reopened: '重新打开'
+};
 
 export default function AuditWorkbench() {
   const queryClient = useQueryClient();
   const [language, setLanguage] = createSignal<'zh' | 'en'>('zh');
   const t = createMemo(() => translator(() => dictionaries[language()], resolveTemplate));
-  const [state, setState] = createStore<WorkbenchState>(loadState());
+  const { state, persist, flushNow, saveStatus, saveError } = createPersistentStore(STORE_KEY, seedState());
   const [selectedId, setSelectedId] = createSignal(state.issues[0]?.id ?? '');
   const [mergeInto, setMergeInto] = createSignal('');
+  const [dependsOnId, setDependsOnId] = createSignal('');
+  const [depError, setDepError] = createSignal<string | null>(null);
   const [focusedIssueId, setFocusedIssueId] = createSignal('');
   const issueQuery = createQuery(() => ({
-    queryKey: ['audit-issues', state.issues.length],
+    queryKey: ['audit-issues', state.issues.length, state.revision],
     queryFn: async () => new Promise<AuditIssue[]>((resolve) => window.setTimeout(() => resolve(state.issues), 120))
   }));
 
@@ -73,32 +61,127 @@ export default function AuditWorkbench() {
   });
 
   const selected = createMemo(() => state.issues.find((issue) => issue.id === selectedId()) ?? state.issues[0]);
+  const selectedDeps = createMemo(() => dependenciesOf(state, selected()?.id ?? ''));
+  const blockers = createMemo(() => activeBlockersOf(state, selected()?.id ?? ''));
+  const blocked = createMemo(() => blockers().length > 0);
 
-  createEffect(() => {
-    if (typeof localStorage !== 'undefined') localStorage.setItem('a11y-audit-v1', JSON.stringify(state));
-  });
-
-  const addEvent = (issueId: string, message: string) => setState('events', (events) => [{ id: crypto.randomUUID(), at: new Date().toISOString(), issueId, message }, ...events]);
-  const updateIssue = (id: string, patch: Partial<AuditIssue>, message: string) => {
-    setState('issues', (issue) => issue.id === id, produce((issue) => Object.assign(issue, patch, { updatedAt: new Date().toISOString() })));
-    addEvent(id, message);
+  const bump = () => {
     void queryClient.invalidateQueries({ queryKey: ['audit-issues'] });
   };
 
   const createIssue = (values: IssueForm) => {
-    const issue: AuditIssue = { id: crypto.randomUUID(), ...values, status: 'open', fixNote: '', retestNote: '', updatedAt: new Date().toISOString() };
-    setState('issues', (issues) => [issue, ...issues]);
+    const issue: AuditIssue = {
+      id: crypto.randomUUID(),
+      ...values,
+      status: 'open',
+      fixNote: '',
+      retestNote: '',
+      updatedAt: new Date().toISOString()
+    };
+    persist((draft) => {
+      draft.issues.unshift(issue);
+      draft.events.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), issueId: issue.id, message: '审计员创建问题并保存证据' });
+    });
     setSelectedId(issue.id);
-    addEvent(issue.id, '审计员创建问题并保存证据');
-    void queryClient.invalidateQueries({ queryKey: ['audit-issues'] });
+    bump();
+  };
+
+  const transition = (patch: Partial<AuditIssue>, message: string) => {
+    const issue = selected();
+    if (!issue) return;
+    persist((draft) => {
+      const target = draft.issues.find((item) => item.id === issue.id);
+      if (!target) return;
+      Object.assign(target, patch, { updatedAt: new Date().toISOString() });
+      draft.events.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), issueId: issue.id, message });
+    });
+    bump();
+  };
+
+  const reopenIssue = () => {
+    const issue = selected();
+    if (!issue) return;
+    persist((draft) => {
+      const target = draft.issues.find((item) => item.id === issue.id);
+      if (!target) return;
+      target.status = 'reopened';
+      target.retestNote = '焦点顺序仍不正确';
+      target.updatedAt = new Date().toISOString();
+      const now = new Date().toISOString();
+      draft.events.unshift({ id: crypto.randomUUID(), at: now, issueId: issue.id, message: '复测失败并重新打开' });
+      // 被它卡住的重复项与依赖项：回到待复测
+      const affected = draft.issues.filter(
+        (item) =>
+          item.id !== issue.id &&
+          (item.canonicalId === issue.id || draft.dependencies.some((dep) => dep.issueId === item.id && dep.dependsOnId === issue.id)) &&
+          (item.status === 'closed' || item.status === 'verifying')
+      );
+      for (const item of affected) {
+        item.status = 'verifying';
+        item.updatedAt = now;
+        draft.events.unshift({
+          id: crypto.randomUUID(),
+          at: now,
+          issueId: item.id,
+          message: `主问题《${issue.title}》复测失败重新打开，本问题回到待复测`
+        });
+      }
+    });
+    bump();
   };
 
   const mergeDuplicate = () => {
     const duplicate = selected();
     const canonical = state.issues.find((issue) => issue.id === mergeInto());
     if (!duplicate || !canonical || duplicate.id === canonical.id) return;
-    updateIssue(duplicate.id, { canonicalId: canonical.id }, `重复问题已合并到 ${canonical.title}`);
+    persist((draft) => {
+      const dup = draft.issues.find((item) => item.id === duplicate.id);
+      if (!dup) return;
+      dup.canonicalId = canonical.id;
+      dup.updatedAt = new Date().toISOString();
+      // 重复项视为被主问题卡住：主问题未关闭前，重复项不能复测
+      if (!draft.dependencies.some((dep) => dep.issueId === dup.id && dep.dependsOnId === canonical.id)) {
+        draft.dependencies.push({ id: crypto.randomUUID(), issueId: dup.id, dependsOnId: canonical.id, createdAt: new Date().toISOString() });
+      }
+      draft.events.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), issueId: dup.id, message: `重复问题已合并到 《${canonical.title}》` });
+    });
+    setMergeInto('');
     setSelectedId(canonical.id);
+    bump();
+  };
+
+  const addDependency = () => {
+    const issue = selected();
+    const blocker = state.issues.find((item) => item.id === dependsOnId());
+    if (!issue || !blocker || issue.id === blocker.id) return;
+    const cycle = findCycle(state, issue.id, blocker.id);
+    if (cycle) {
+      const names = [issue, ...cycle, issue].map((item) => `《${item.title}》`).join(' → ');
+      setDepError(`检测到循环依赖：${names}。请先解除已有依赖，再登记新的依赖。`);
+      return;
+    }
+    setDepError(null);
+    persist((draft) => {
+      draft.dependencies.push({ id: crypto.randomUUID(), issueId: issue.id, dependsOnId: blocker.id, createdAt: new Date().toISOString() });
+      draft.events.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), issueId: issue.id, message: `登记依赖：等待《${blocker.title}》修复后才能复测` });
+    });
+    setDependsOnId('');
+  };
+
+  const removeDependency = (dep: Dependency) => {
+    const issue = selected();
+    const blocker = state.issues.find((item) => item.id === dep.dependsOnId);
+    persist((draft) => {
+      draft.dependencyTombstones.push(dep.id);
+      draft.dependencies = draft.dependencies.filter((item) => item.id !== dep.id);
+      draft.events.unshift({
+        id: crypto.randomUUID(),
+        at: new Date().toISOString(),
+        issueId: dep.issueId,
+        message: `解除依赖：不再等待《${blocker?.title ?? '已删除问题'}》`
+      });
+    });
+    if (issue) setDepError(null);
   };
 
   onMount(() => {
@@ -121,6 +204,14 @@ export default function AuditWorkbench() {
           <button class="secondary" onClick={() => setLanguage(language() === 'zh' ? 'en' : 'zh')}>{language() === 'zh' ? 'English' : '中文'}</button>
         </header>
 
+        <Show when={saveStatus() === 'saving'}><p role="status" class="save-banner">正在保存…</p></Show>
+        <Show when={saveStatus() === 'error'}>
+          <p role="alert" class="save-banner save-error">
+            保存失败：{saveError()}。其他标签页的改动没有丢失，可重试。
+            <button class="secondary" style="margin-left:10px" onClick={flushNow}>重试写入</button>
+          </p>
+        </Show>
+
         <section class="stats" aria-label="审计概览">
           <div class="card"><span>全部问题</span><strong>{state.issues.length}</strong></div>
           <div class="card"><span>待修复</span><strong>{state.issues.filter((issue) => ['open', 'triaged', 'fixing', 'reopened'].includes(issue.status)).length}</strong></div>
@@ -134,7 +225,13 @@ export default function AuditWorkbench() {
             <For each={state.issues}>{(issue) => (
               <article class="issue" style={focusedIssueId() === issue.id ? 'background:#eefaf8;border-radius:10px;padding-left:12px' : ''}>
                 <h3><button class="secondary" onClick={() => setSelectedId(issue.id)} aria-current={selectedId() === issue.id ? 'true' : undefined}>{issue.title}</button></h3>
-                <div class="meta"><span class="badge">{issue.status}</span><span class="badge">{issue.severity}</span><span>{issue.flow}</span><span>{issue.impactGroup}</span><Show when={issue.canonicalId}><span class="badge">重复项</span></Show></div>
+                <div class="meta">
+                  <span class="badge">{statusLabel[issue.status]}</span>
+                  <span class="badge">{issue.severity}</span>
+                  <span>{issue.flow}</span><span>{issue.impactGroup}</span>
+                  <Show when={activeBlockersOf(state, issue.id).length > 0}><span class="badge badge-blocked">被卡住</span></Show>
+                  <Show when={issue.canonicalId}><span class="badge">重复项</span></Show>
+                </div>
               </article>
             )}</For>
           </section>
@@ -149,12 +246,51 @@ export default function AuditWorkbench() {
                 <p><strong>修复记录：</strong>{issue.fixNote || '尚未填写'}</p>
                 <p><strong>复测记录：</strong>{issue.retestNote || '尚未填写'}</p>
                 <div role="group" aria-label="问题状态操作">
-                  <button onClick={() => updateIssue(issue.id, { status: 'triaged' }, '审核员完成分诊')}>确认问题</button>{' '}
-                  <button onClick={() => updateIssue(issue.id, { status: 'fixing', fixNote: '修复进行中，等待提交复测版本' }, '开发人员开始修复')}>开始修复</button>{' '}
-                  <button onClick={() => updateIssue(issue.id, { status: 'verifying' }, '开发人员提交修复，进入复测')}>提交复测</button>{' '}
-                  <button onClick={() => updateIssue(issue.id, { status: 'closed', retestNote: '键盘、读屏和错误提示均已通过' }, '复测通过并关闭问题')}>复测通过</button>{' '}
-                  <button class="danger" onClick={() => updateIssue(issue.id, { status: 'reopened', retestNote: '焦点顺序仍不正确' }, '复测失败并重新打开')}>复测失败</button>
+                  <button onClick={() => transition({ status: 'triaged' }, '审核员完成分诊')}>确认问题</button>{' '}
+                  <button onClick={() => transition({ status: 'fixing', fixNote: '修复进行中，等待提交复测版本' }, '开发人员开始修复')}>开始修复</button>{' '}
+                  <button
+                    disabled={blocked()}
+                    title={blocked() ? `等待 ${blockers().map((item) => `《${item.title}》`).join('、')} 修复后才能复测` : undefined}
+                    onClick={() => transition({ status: 'verifying' }, '开发人员提交修复，进入复测')}
+                  >提交复测</button>{' '}
+                  <button
+                    disabled={blocked()}
+                    title={blocked() ? `前置问题未关闭，不能结束复测` : undefined}
+                    onClick={() => transition({ status: 'closed', retestNote: '键盘、读屏和错误提示均已通过' }, '复测通过并关闭问题')}
+                  >复测通过</button>{' '}
+                  <button class="danger" onClick={reopenIssue}>复测失败</button>
                 </div>
+                <Show when={blocked()}>
+                  <p class="error" role="status">该问题被 {blockers().map((item) => `《${item.title}》`).join('、')} 卡住，前置问题修复并关闭后才能复测。</p>
+                </Show>
+                <hr />
+                <section aria-label="依赖关系">
+                  <h4>依赖关系</h4>
+                  <Show when={selectedDeps().length > 0} fallback={<p>没有已登记的依赖。</p>}>
+                    <ul class="dep-list">
+                      <For each={selectedDeps()}>{(dep) => {
+                        const blocker = () => state.issues.find((item) => item.id === dep.dependsOnId);
+                        return (
+                          <li>
+                            《{blocker()?.title ?? '已删除问题'}》
+                            <Show when={blocker()}><span class="badge">{statusLabel[blocker()!.status]}</span></Show>
+                            <button class="secondary" onClick={() => removeDependency(dep)}>解除依赖</button>
+                          </li>
+                        );
+                      }}</For>
+                    </ul>
+                  </Show>
+                  <label>登记依赖（等待哪个问题修复）
+                    <select value={dependsOnId()} onChange={(event) => { setDependsOnId(event.currentTarget.value); setDepError(null); }}>
+                      <option value="">选择问题</option>
+                      <For each={state.issues.filter((item) => item.id !== issue.id && !selectedDeps().some((dep) => dep.dependsOnId === item.id))}>
+                        {(item) => <option value={item.id}>{item.title}</option>}
+                      </For>
+                    </select>
+                  </label>
+                  <button disabled={!dependsOnId()} onClick={addDependency}>登记依赖</button>
+                  <Show when={depError()}><p class="error" role="alert">{depError()}</p></Show>
+                </section>
                 <hr />
                 <label>合并到主问题<select value={mergeInto()} onChange={(event) => setMergeInto(event.currentTarget.value)}><option value="">选择问题</option><For each={state.issues.filter((item) => item.id !== issue.id && !item.canonicalId)}>{(item) => <option value={item.id}>{item.title}</option>}</For></select></label>
                 <button disabled={!mergeInto()} onClick={mergeDuplicate}>确认重复合并</button>
@@ -167,11 +303,11 @@ export default function AuditWorkbench() {
           <section class="card">
             <h2>新建审计问题</h2>
             <AuditForm onSubmit={createIssue} style="margin-top:12px">
-              <AuditField name="title">{ (field, props) => <label>问题标题<input id="issue-title" {...props} value={field.value} onInput={(event) => field.value = event.currentTarget.value} aria-invalid={field.error ? 'true' : undefined} aria-describedby={field.error ? 'title-error' : undefined} /><Show when={field.error}><p class="error" id="title-error" role="alert">{field.error}</p></Show></label> }</AuditField>
-              <AuditField name="flow">{ (field, props) => <label>业务流程<input {...props} value={field.value} onInput={(event) => field.value = event.currentTarget.value} /></label> }</AuditField>
-              <AuditField name="steps">{ (field, props) => <label>复现步骤<textarea {...props} rows={4} value={field.value} onInput={(event) => field.value = event.currentTarget.value} /></label> }</AuditField>
-              <AuditField name="impactGroup">{ (field) => <label>影响人群<select value={field.value} onChange={(event) => field.value = event.currentTarget.value}><option>键盘与读屏用户</option><option>低视力用户</option><option>认知障碍用户</option><option>行动障碍用户</option></select></label> }</AuditField>
-              <AuditField name="severity">{ (field) => <label>严重程度<select value={field.value} onChange={(event) => field.value = event.currentTarget.value as Severity}><option value="critical">阻断</option><option value="serious">严重</option><option value="moderate">中等</option><option value="minor">轻微</option></select></label> }</AuditField>
+              <AuditField name="title">{ (field, props) => <label>问题标题<input id="issue-title" {...props} value={field.value} onInput={(event) => setValue(form, 'title', event.currentTarget.value)} aria-invalid={field.error ? 'true' : undefined} aria-describedby={field.error ? 'title-error' : undefined} /><Show when={field.error}><p class="error" id="title-error" role="alert">{field.error}</p></Show></label> }</AuditField>
+              <AuditField name="flow">{ (field, props) => <label>业务流程<input {...props} value={field.value} onInput={(event) => setValue(form, 'flow', event.currentTarget.value)} /></label> }</AuditField>
+              <AuditField name="steps">{ (field, props) => <label>复现步骤<textarea {...props} rows={4} value={field.value} onInput={(event) => setValue(form, 'steps', event.currentTarget.value)} /></label> }</AuditField>
+              <AuditField name="impactGroup">{ (field) => <label>影响人群<select value={field.value} onChange={(event) => setValue(form, 'impactGroup', event.currentTarget.value)}><option>键盘与读屏用户</option><option>低视力用户</option><option>认知障碍用户</option><option>行动障碍用户</option></select></label> }</AuditField>
+              <AuditField name="severity">{ (field) => <label>严重程度<select value={field.value} onChange={(event) => setValue(form, 'severity', event.currentTarget.value as Severity)}><option value="critical">阻断</option><option value="serious">严重</option><option value="moderate">中等</option><option value="minor">轻微</option></select></label> }</AuditField>
               <button type="submit">创建问题</button>
             </AuditForm>
           </section>
